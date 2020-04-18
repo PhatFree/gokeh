@@ -1,82 +1,97 @@
 package filter
 
 import (
+	"fmt"
 	"image"
 	"image/color"
+	"image/png"
+	"os"
 
 	"github.com/anthonynsimon/bild/clone"
 	"github.com/anthonynsimon/bild/fcolor"
 	"github.com/anthonynsimon/bild/parallel"
 )
 
-func ApplyBlur(in image.RGBA64, mask image.Gray16) (out *image.RGBA64) {
+func ApplyBlur(in *image.RGBA, mask *image.Gray16) (out *image.RGBA) {
 	// Copy the input image into the output image
-	out = image.NewRGBA64(in.Bounds())
+	out = clone.AsRGBA(in)
 
 	// Look at each pixel in the mask
 	bounds := mask.Bounds()
 	for x := 0; x < bounds.Dx(); x++ {
-		for y := 0; x < bounds.Dy(); y++ {
+		for y := 0; y < bounds.Dy(); y++ {
 			maskPixel := mask.At(x, y).(color.Gray16)
 			// Make sure that mask pixel isn't black
 			// TODO: maybe also check if it's just really dim
 			if maskPixel.Y != 0 {
 				// accumulate a shifted copy of the color image weighted by the mask
 				multLayer := multiply(in, maskPixel)
-				out = offsetAdd(out, multLayer, x, y)
+				adjMult := multiply(multLayer, color.Gray{Y: 255 / 2})
+				adjIn := multiply(out, color.Gray{Y: 255 / 2})
+				newOut := offsetAdd(adjIn, adjMult, x, y)
+				out = offsetAdd(out, newOut, 0, 0)
+
+				// outputFile is a File type which satisfies Writer interface
+				path := fmt.Sprintf("output.%d-%d.png", x, y)
+				outputFile, err := os.Create(path)
+				if err != nil {
+					panic("Failed to output image")
+				}
+
+				// Encode takes a writer interface and an image interface
+				// We pass it the File and the RGBA
+				png.Encode(outputFile, out)
+
+				// Don't forget to close files
+				outputFile.Close()
+			}
+		}
+	}
+	// out = multiply(out, color.Gray16{Y: maskTotal / 3})
+
+	return out
+}
+
+func offsetAdd(bg *image.RGBA, fg *image.RGBA, xOffset int, yOffset int) (out *image.RGBA) {
+	bgBounds := bg.Bounds()
+	width := bgBounds.Dx()
+	height := bgBounds.Dy()
+
+	out = image.NewRGBA(image.Rect(0, 0, width, height))
+
+	// Add the two images, offseting the fg image
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			// Wrap around if we go over
+			adjY := y + yOffset
+			adjX := x + xOffset
+			if adjY >= height {
+				adjY = adjY - height
+			}
+			if adjX >= width {
+				adjX = adjX - width
 			}
 
+			// take the background pixel and the shifted fg pixel and add them
+			bgPos := y*bg.Stride + x*4
+			fgPos := adjY*fg.Stride + adjX*4
+			result := add(
+				fcolor.NewRGBAF64(bg.Pix[bgPos+0], bg.Pix[bgPos+1], bg.Pix[bgPos+2], bg.Pix[bgPos+3]),
+				fcolor.NewRGBAF64(fg.Pix[fgPos+0], fg.Pix[fgPos+1], fg.Pix[fgPos+2], fg.Pix[fgPos+3]))
+
+			result.Clamp()
+			outPos := y*out.Stride + x*4
+			out.Pix[outPos+0] = uint8(result.R * 255)
+			out.Pix[outPos+1] = uint8(result.G * 255)
+			out.Pix[outPos+2] = uint8(result.B * 255)
+			out.Pix[outPos+3] = uint8(result.A * 255)
 		}
 	}
 
 	return out
 }
 
-func offsetAdd(bg image.Image, fg image.Image, xOffset int, yOffset int) (out *image.RGBA64) {
-	bgBounds := bg.Bounds()
-	width := bgBounds.Dx()
-	height := bgBounds.Dy()
-
-	bgSrc := clone.AsRGBA(bg)
-	fgSrc := clone.AsRGBA(fg)
-	out = image.NewRGBA64(image.Rect(0, 0, width, height))
-
-	// Add the two images, offseting the fg image
-	parallel.Line(height, func(start, end int) {
-		for y := start; y < end; y++ {
-			// Make ser we don't go off the bottom
-			if y+yOffset > end {
-				break
-			}
-
-			for x := 0; x < width; x++ {
-				// make sure we don't go off the right
-				if x+xOffset > width {
-					break
-				}
-
-				// take the background pixel and the shifted fg pixel and add them
-				bgPos := y*bgSrc.Stride + x*4
-				fgPos := (y+yOffset)*fgSrc.Stride + (x+xOffset)*4
-				result := add(
-					fcolor.NewRGBAF64(bgSrc.Pix[bgPos+0], bgSrc.Pix[bgPos+1], bgSrc.Pix[bgPos+2], bgSrc.Pix[bgPos+3]),
-					fcolor.NewRGBAF64(fgSrc.Pix[fgPos+0], fgSrc.Pix[fgPos+1], fgSrc.Pix[fgPos+2], fgSrc.Pix[fgPos+3]))
-
-				result.Clamp()
-				outPos := y*out.Stride + x*4
-				out.Pix[outPos+0] = uint8(result.R * 255)
-				out.Pix[outPos+1] = uint8(result.G * 255)
-				out.Pix[outPos+2] = uint8(result.B * 255)
-				out.Pix[outPos+3] = uint8(result.A * 255)
-			}
-
-		}
-	})
-
-	return out
-}
-
-func multiply(in image.RGBA64, mult color.Color) (out *image.RGBA) {
+func multiply(in *image.RGBA, mult color.Color) (out *image.RGBA) {
 	bounds := in.Bounds()
 	r, g, b, a := mult.RGBA()
 	multColor := fcolor.NewRGBAF64(uint8(r), uint8(g), uint8(b), uint8(a))
@@ -84,15 +99,14 @@ func multiply(in image.RGBA64, mult color.Color) (out *image.RGBA) {
 	width := bounds.Dx()
 	height := bounds.Dy()
 
-	inSrc := clone.AsRGBA(&in)
 	out = image.NewRGBA(bounds)
 
 	parallel.Line(height, func(start, end int) {
 		for y := start; y < end; y++ {
 			for x := 0; x < width; x++ {
-				pos := y*inSrc.Stride + x*4
+				pos := y*in.Stride + x*4
 				result := colorMult(
-					fcolor.NewRGBAF64(inSrc.Pix[pos+0], inSrc.Pix[pos+1], inSrc.Pix[pos+2], inSrc.Pix[pos+3]),
+					fcolor.NewRGBAF64(in.Pix[pos+0], in.Pix[pos+1], in.Pix[pos+2], in.Pix[pos+3]),
 					multColor)
 
 				result.Clamp()
@@ -117,8 +131,6 @@ func add(c0, c1 fcolor.RGBAF64) fcolor.RGBAF64 {
 	return alphaComp(c0, c2)
 }
 
-// Multiply combines the foreground and background images by multiplying their
-// normalized values and returns the resulting image.
 func colorMult(c0, c1 fcolor.RGBAF64) fcolor.RGBAF64 {
 	r := c0.R * c1.R
 	g := c0.G * c1.G
